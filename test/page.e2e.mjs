@@ -55,6 +55,19 @@ const check = (name, ok, extra = "") => { results.push({ name, ok, extra }); if 
 const evidence = process.env.GRILL_EVIDENCE_DIR;
 if (evidence) mkdirSync(evidence, { recursive: true });
 const capture = async (name) => { if (evidence) await page.screenshot({ path: join(evidence, name), fullPage: true }); };
+// WCAG contrast of two colours as the page resolves them under a theme (light-dark() included).
+// fg and bg are [selector, computed-style property]. One synchronous evaluate: nothing repaints.
+const contrast = (theme, fg, bg) => page.evaluate(([theme, fg, bg]) => {
+  const root = document.documentElement, was = root.dataset.theme; root.dataset.theme = theme;
+  const lum = ([sel, prop]) => {
+    const x = document.createElement("canvas").getContext("2d"); x.fillStyle = getComputedStyle(document.querySelector(sel))[prop]; x.fillRect(0, 0, 1, 1);
+    const [r, g, b] = [...x.getImageData(0, 0, 1, 1).data].slice(0, 3).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const a = lum(fg), b = lum(bg); root.dataset.theme = was;
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}, [theme, fg, bg]);
+const readable = async (fg, bg, min) => { const r = [await contrast("light", fg, bg), await contrast("dark", fg, bg)]; return { ok: r.every((x) => x >= min), extra: `light ${r[0].toFixed(2)}:1, dark ${r[1].toFixed(2)}:1, need ${min}:1` }; };
 
 try {
   await page.goto(url);
@@ -95,6 +108,29 @@ try {
   check("terms panel shows the term and its avoid list", (await page.locator("#terms").textContent()).includes("Avoid: submit, reply"));
   await page.locator("h1").click();
 
+  // theme: the toggle cycles system → light → dark. System follows the OS, the other two
+  // override it, and the server keeps the choice so a reload (or the next grill) starts with it.
+  const mode = () => page.locator("#theme-toggle").getAttribute("data-mode");
+  const isDark = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor.match(/\d+/g).slice(0, 3).reduce((n, v) => n + Number(v), 0) < 384);
+  const cycle = async () => { const r = page.waitForResponse((x) => x.url().endsWith("/theme") && x.request().method() === "POST"); await page.locator("#theme-toggle").click(); return (await r).status(); };
+  await page.emulateMedia({ colorScheme: "dark" });
+  check("theme: system follows a dark OS", (await mode()) === "system" && await isDark());
+  await page.emulateMedia({ colorScheme: "light" });
+  check("theme: system follows a light OS", !(await isDark()));
+  await page.emulateMedia({ colorScheme: "dark" });
+  check("theme: first click forces light over a dark OS", (await cycle()) === 200 && (await mode()) === "light" && !(await isDark()));
+  await page.emulateMedia({ colorScheme: "light" });
+  check("theme: second click forces dark over a light OS", (await cycle()) === 200 && (await mode()) === "dark" && await isDark());
+  await page.reload();
+  await page.locator(".item").first().waitFor();
+  check("theme: the choice survives a reload, set before the script runs", (await mode()) === "dark" && await isDark() && (await (await fetch(url)).text()).includes('<html lang="en" data-theme="dark">'));
+  await capture("theme-dark.png");
+  check("theme: third click returns to system", (await cycle()) === 200 && (await mode()) === "system" && !(await isDark()));
+  await page.locator(".item", { hasText: "Q1" }).click();
+  let cr = await readable([".opt.chosen .check path", "stroke"], [".opt.chosen .check circle", "fill"], 3);
+  check("theme: the tick on a chosen option stands out from its circle in both themes", cr.ok, cr.extra);
+  await page.locator(".item", { hasText: "Q3" }).click();
+
   await page.locator(".opt.rec").click();
   check("staging an option dims the rest of the card, the picked box stays full", await page.locator(".card.picked").count() === 1
     && (await page.locator(".opt.staged").evaluate((el) => getComputedStyle(el).opacity)) === "1"
@@ -103,6 +139,8 @@ try {
   await page.locator("#thread-in").fill("Would Alpha be simpler?");
   await page.locator("#stage-thread").click();
   check("staged count 2", (await page.locator("#send").textContent()) === "Send 2 to Agent");
+  cr = await readable(["#send", "color"], ["#send", "backgroundColor"], 4.5);
+  check("theme: Send to Agent is readable in both themes", await page.locator("#send").isEnabled() && cr.ok, cr.extra);
   // ⌘↩ in a compose box stages the draft; a second ⌘↩ sends it (issue #12)
   await page.locator(".item", { hasText: "Q4" }).click();
   await page.locator("#free").fill("Short and sweet");
@@ -366,6 +404,8 @@ try {
   check("inline confirm shown", await page.locator("#finish-yes").count() === 1);
   check("confirm keeps the green but stops blinking", await page.locator("#finish-yes.ready").count() === 1
     && (await page.locator("#finish-yes").evaluate((el) => getComputedStyle(el).animationName)) === "none");
+  cr = await readable(["#finish-yes", "color"], ["#finish-yes", "backgroundColor"], 4.5);
+  check("theme: the green confirm is readable in both themes", cr.ok, cr.extra);
   await page.locator("#finish-no").click();
   check("cancel keeps the finish button", await page.locator("#finish").count() === 1 && await page.locator("#finish-yes").count() === 0);
   await page.locator("#finish").click(); await page.locator("#finish-yes").click();
